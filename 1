@@ -1,0 +1,407 @@
+#!/usr/bin/env node
+/**
+ * Single-file long-document -> lecture PPTX generator.
+ *
+ * Usage:
+ *   node lecture-pptx-all-in-one.js --pdf ./input.pdf --out ./output.pptx
+ *   node lecture-pptx-all-in-one.js --sample --out ./sample-output.pptx
+ *
+ * Optional flags:
+ *   --audience "medical students"
+ *   --verbosity standard|concise|detailed
+ *   --slideCountTarget 24
+ *   --slidesPer10Pages 4
+ *   --includeFigures true|false
+ */
+
+import fs from "fs/promises";
+import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
+import PptxGenJS from "pptxgenjs";
+
+function parseArgs(argv) {
+  const args = {};
+  for (let i = 2; i < argv.length; i += 1) {
+    const key = argv[i];
+    const value = argv[i + 1];
+    if (!key.startsWith("--")) continue;
+    const normalized = key.slice(2);
+    if (["sample"].includes(normalized)) {
+      args[normalized] = true;
+      continue;
+    }
+    args[normalized] = value;
+    i += 1;
+  }
+  return args;
+}
+
+/**
+ * @typedef {{pageNumber:number,text:string}} PageText
+ * @typedef {{chunkId:string,heading:string,startPage:number,endPage:number,paragraphs:string[],text:string}} Chunk
+ * @typedef {{chunkId:string,heading:string,keyDefinitions:string[],mechanisms:string[],steps:string[],evidence:string[],conclusions:string[],keyTerms:string[],sourceRange:{startPage:number,endPage:number}}} ChunkSummary
+ * @typedef {{title:string,keyTerms:string[],slideCandidates:Array<{title:string,bullets:string[],notePoints:string[],sourceRange:{startPage:number,endPage:number},figureCaption?:string}>}} SectionOutline
+ * @typedef {{title:string,bullets:string[],speakerNotes:string,sourceRange:{startPage:number,endPage:number},figure:{placeholder:string,caption:string}|null}} SlideSpec
+ */
+
+async function extractPdfTextWithPages(pdfPath) {
+  const raw = await fs.readFile(pdfPath);
+  const loadingTask = pdfjsLib.getDocument({ data: raw });
+  const pdf = await loadingTask.promise;
+
+  /** @type {PageText[]} */
+  const pages = [];
+  for (let i = 1; i <= pdf.numPages; i += 1) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    const text = content.items
+      .map((item) => ("str" in item ? item.str : ""))
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+    pages.push({ pageNumber: i, text });
+  }
+
+  return { pages, totalPages: pdf.numPages };
+}
+
+function fromPageTextArray(pageTexts) {
+  return {
+    totalPages: pageTexts.length,
+    pages: pageTexts.map((text, idx) => ({ pageNumber: idx + 1, text: text.trim() })),
+  };
+}
+
+const HEADING_REGEX = /^(?:\d+(?:\.\d+)*)?\s*(?:[A-Z][A-Z\s\-]{3,}|[A-Z][^\n:]{2,80}:)$/;
+
+function splitIntoParagraphs(text) {
+  return text.split(/(?<=[.!?])\s+/).map((x) => x.trim()).filter(Boolean);
+}
+
+function detectHeading(sentence) {
+  const normalized = sentence.trim();
+  if (normalized.length > 100) return false;
+  return HEADING_REGEX.test(normalized);
+}
+
+function chunkDocument(extracted, opts = {}) {
+  const maxCharsPerChunk = opts.maxCharsPerChunk ?? 5000;
+  /** @type {Chunk[]} */
+  const chunks = [];
+
+  let current = null;
+  let chunkCounter = 1;
+
+  const flushCurrent = () => {
+    if (!current || current.paragraphs.length === 0) return;
+    current.text = current.paragraphs.join(" ");
+    chunks.push(current);
+    current = null;
+  };
+
+  for (const page of extracted.pages) {
+    const paragraphs = splitIntoParagraphs(page.text);
+    for (const paragraph of paragraphs) {
+      const isHeading = detectHeading(paragraph);
+
+      if (!current) {
+        current = {
+          chunkId: `chunk-${chunkCounter++}`,
+          heading: isHeading ? paragraph.replace(/:$/, "") : "Untitled Section",
+          startPage: page.pageNumber,
+          endPage: page.pageNumber,
+          paragraphs: [],
+          text: "",
+        };
+      }
+
+      if (isHeading && current.paragraphs.length > 0) {
+        flushCurrent();
+        current = {
+          chunkId: `chunk-${chunkCounter++}`,
+          heading: paragraph.replace(/:$/, ""),
+          startPage: page.pageNumber,
+          endPage: page.pageNumber,
+          paragraphs: [],
+          text: "",
+        };
+        continue;
+      }
+
+      current.paragraphs.push(paragraph);
+      current.endPage = page.pageNumber;
+
+      if (current.paragraphs.join(" ").length >= maxCharsPerChunk) {
+        flushCurrent();
+      }
+    }
+  }
+
+  flushCurrent();
+  return chunks;
+}
+
+const DEF_HINTS = [/\bdefined as\b/i, /\bis\b/i, /\brefers to\b/i];
+const MECH_HINTS = [/\bmechanism\b/i, /\bpathway\b/i, /\bleads to\b/i, /\bcauses\b/i];
+const STEP_HINTS = [/\bfirst\b/i, /\bsecond\b/i, /\bthen\b/i, /\bstep\b/i, /\bnext\b/i];
+const EVID_HINTS = [/\bstudy\b/i, /\btrial\b/i, /\bresult\b/i, /\b%\b/, /\bp-value\b/i, /\bevidence\b/i];
+const CONC_HINTS = [/\bin conclusion\b/i, /\btherefore\b/i, /\brecommend\b/i, /\bsummary\b/i];
+
+function sentenceSplit(text) {
+  return text.split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter(Boolean);
+}
+
+function collectByHints(sentences, hints, max = 4) {
+  return sentences.filter((s) => hints.some((h) => h.test(s))).slice(0, max);
+}
+
+function extractKeyTerms(text) {
+  const matches = text.match(/\b[A-Z][a-zA-Z\-]{3,}\b/g) || [];
+  return [...new Set(matches)].slice(0, 8);
+}
+
+function summarizeChunkToJson(chunk) {
+  const sentences = sentenceSplit(chunk.text);
+  return {
+    chunkId: chunk.chunkId,
+    heading: chunk.heading,
+    keyDefinitions: collectByHints(sentences, DEF_HINTS, 4),
+    mechanisms: collectByHints(sentences, MECH_HINTS, 4),
+    steps: collectByHints(sentences, STEP_HINTS, 5),
+    evidence: collectByHints(sentences, EVID_HINTS, 4),
+    conclusions: collectByHints(sentences, CONC_HINTS, 3),
+    keyTerms: extractKeyTerms(chunk.text),
+    sourceRange: { startPage: chunk.startPage, endPage: chunk.endPage },
+  };
+}
+
+function buildGlobalOutline(summaries) {
+  /** @type {Map<string, SectionOutline>} */
+  const sectionMap = new Map();
+
+  for (const summary of summaries) {
+    const sectionTitle = summary.heading || "Untitled Section";
+    if (!sectionMap.has(sectionTitle)) {
+      sectionMap.set(sectionTitle, { title: sectionTitle, keyTerms: [], slideCandidates: [] });
+    }
+    const section = sectionMap.get(sectionTitle);
+    section.keyTerms = [...new Set([...section.keyTerms, ...summary.keyTerms])].slice(0, 12);
+
+    const bullets = [
+      ...summary.keyDefinitions,
+      ...summary.mechanisms,
+      ...summary.steps,
+      ...summary.evidence,
+      ...summary.conclusions,
+    ].slice(0, 8);
+
+    section.slideCandidates.push({
+      title: sectionTitle,
+      bullets,
+      notePoints: bullets.length ? bullets : ["Core section content extracted from source text."],
+      sourceRange: summary.sourceRange,
+      figureCaption: `Figure placeholder for ${sectionTitle}`,
+    });
+  }
+
+  return [...sectionMap.values()];
+}
+
+function ensureBulletCount(bullets, min = 4, max = 6) {
+  const clean = bullets.map((b) => b.trim()).filter(Boolean);
+  if (clean.length >= min) return clean.slice(0, max);
+  const filler = [
+    "Clinical relevance for medical students",
+    "Decision points for diagnosis and treatment",
+    "Common pitfalls and interpretation caveats",
+    "How this informs bedside reasoning",
+  ];
+  return [...clean, ...filler].slice(0, min);
+}
+
+function buildSpeakerNotes({ title, bullets, sourceRange, audience }) {
+  let body = `In this slide, we focus on ${title}. For ${audience}, pay attention to how each point connects mechanism to clinical decisions. ${bullets
+    .map((b, i) => `Point ${i + 1}: ${b}.`)
+    .join(" ")} As you review, prioritize definitions, sequence of events, and what evidence changes practice. Tie these facts to exam-style reasoning: identify the trigger, mechanism, expected findings, and the next action. Keep this mental model for ward discussions and objective structured assessments.`;
+
+  const words = body.split(/\s+/).length;
+  if (words < 80) {
+    body += " Rehearse the narrative once out loud to ensure each bullet can be explained from first principles.";
+  }
+  if (body.split(/\s+/).length > 140) {
+    body = body.split(/\s+/).slice(0, 136).join(" ") + " ...";
+  }
+
+  return `${body}\n\nSources: p.${sourceRange.startPage}–p.${sourceRange.endPage}`;
+}
+
+function buildSlideSpecs(sections, controls) {
+  const audience = controls.targetAudience || "medical students";
+  const includeFigures = controls.includeFigures ?? false;
+  /** @type {SlideSpec[]} */
+  const specs = [];
+
+  for (const section of sections) {
+    for (const candidate of section.slideCandidates) {
+      const bullets = ensureBulletCount(candidate.bullets);
+      specs.push({
+        title: candidate.title,
+        bullets,
+        speakerNotes: buildSpeakerNotes({ title: candidate.title, bullets, sourceRange: candidate.sourceRange, audience }),
+        sourceRange: candidate.sourceRange,
+        figure: includeFigures ? { placeholder: "[Figure Placeholder]", caption: candidate.figureCaption || "Figure" } : null,
+      });
+    }
+
+    specs.push({
+      title: `${section.title} — Key Terms`,
+      bullets: ensureBulletCount(section.keyTerms.map((t) => `${t}: concise definition from source context`)),
+      speakerNotes: buildSpeakerNotes({
+        title: `${section.title} key terms`,
+        bullets: section.keyTerms,
+        sourceRange: section.slideCandidates[0]?.sourceRange || { startPage: 1, endPage: 1 },
+        audience,
+      }),
+      sourceRange: section.slideCandidates[0]?.sourceRange || { startPage: 1, endPage: 1 },
+      figure: null,
+    });
+  }
+
+  const allBullets = specs.flatMap((s) => s.bullets).slice(0, 6);
+  const finalRange = specs[specs.length - 1]?.sourceRange || { startPage: 1, endPage: 1 };
+  specs.push({
+    title: "Takeaways + Exam Questions",
+    bullets: ensureBulletCount([
+      ...allBullets.slice(0, 3).map((x) => `Takeaway: ${x}`),
+      "Exam Q1: Explain mechanism and first-line management.",
+      "Exam Q2: Interpret evidence and apply to a patient scenario.",
+      "Exam Q3: Compare two differential diagnoses using key findings.",
+    ]),
+    speakerNotes: buildSpeakerNotes({ title: "course wrap-up and exam questions", bullets: allBullets, sourceRange: finalRange, audience }),
+    sourceRange: finalRange,
+    figure: null,
+  });
+
+  const inferredTarget = controls.slideCountTarget
+    ?? (controls.slidesPer10Pages && controls.totalPages
+      ? Math.max(6, Math.round((controls.totalPages / 10) * controls.slidesPer10Pages))
+      : specs.length);
+
+  if (specs.length > inferredTarget) {
+    return specs.slice(0, inferredTarget - 1).concat(specs[specs.length - 1]);
+  }
+  return specs;
+}
+
+function runQaChecks(input) {
+  const warnings = [];
+  const sectionTitles = input.sections.map((s) => s.title);
+  const slideTitles = input.slides.map((s) => s.title);
+
+  const missingSections = sectionTitles.filter((title) => !slideTitles.some((st) => st.includes(title)));
+  if (missingSections.length) warnings.push(`Coverage warning: missing section slides for ${missingSections.join(", ")}`);
+
+  const target = input.controls.slideCountTarget
+    ?? (input.controls.slidesPer10Pages && input.controls.totalPages
+      ? Math.max(6, Math.round((input.controls.totalPages / 10) * input.controls.slidesPer10Pages))
+      : null);
+
+  if (target !== null && input.slides.length > target + 1) {
+    warnings.push(`Slide count warning: generated ${input.slides.length}, target is ${target}.`);
+  }
+
+  const seen = new Set();
+  let duplicateCount = 0;
+  for (const slide of input.slides) {
+    for (const bullet of slide.bullets) {
+      const key = bullet.toLowerCase();
+      if (seen.has(key)) duplicateCount += 1;
+      seen.add(key);
+    }
+  }
+  if (duplicateCount > 6) warnings.push(`Duplication warning: ${duplicateCount} repeated bullet ideas detected.`);
+
+  const hasDefinition = input.slides.some((s) => s.bullets.some((b) => /\bdefined|refers to|is\b/i.test(b)));
+  if (!hasDefinition) warnings.push("Content warning: missing definition-oriented bullets.");
+
+  const hasEvidence = input.slides.some((s) => s.bullets.some((b) => /\bstudy|trial|result|evidence|%\b/i.test(b)));
+  if (!hasEvidence) warnings.push("Content warning: missing evidence/results bullets.");
+
+  return { passed: warnings.length === 0, warnings };
+}
+
+async function writePptx(slides, outputPath) {
+  const pptx = new PptxGenJS();
+  pptx.layout = "LAYOUT_WIDE";
+  pptx.author = "Clinical Pathway Lecture Builder";
+  pptx.subject = "Auto-generated lecture deck";
+  pptx.title = "Document to Lecture Slides";
+
+  for (const spec of slides) {
+    const slide = pptx.addSlide();
+    slide.addText(spec.title, { x: 0.5, y: 0.3, w: 12, h: 0.6, fontSize: 28, bold: true, color: "1F2937" });
+
+    slide.addText(spec.bullets.map((b) => ({ text: b, options: { bullet: { indent: 18 } } })), {
+      x: 0.8, y: 1.2, w: 7.8, h: 4.6, fontSize: 20, color: "111827", breakLine: true, paraSpaceAfterPt: 12,
+    });
+
+    if (spec.figure) {
+      slide.addShape(pptx.ShapeType.rect, { x: 8.8, y: 1.5, w: 4.0, h: 2.8, line: { color: "9CA3AF" }, fill: { color: "F9FAFB" } });
+      slide.addText(spec.figure.placeholder, { x: 9.1, y: 2.65, w: 3.4, h: 0.3, fontSize: 12, align: "center", color: "6B7280" });
+      slide.addText(spec.figure.caption, { x: 8.8, y: 4.4, w: 4.1, h: 0.5, fontSize: 11, color: "374151" });
+    }
+
+    slide.addNotes(spec.speakerNotes);
+  }
+
+  await pptx.writeFile({ fileName: outputPath });
+}
+
+async function generateLectureDeck({ pdfPath, extracted, controls, outputPath }) {
+  const source = extracted ?? await extractPdfTextWithPages(pdfPath);
+  const chunks = chunkDocument(source);
+  const summaries = chunks.map(summarizeChunkToJson);
+  const sections = buildGlobalOutline(summaries);
+  const slides = buildSlideSpecs(sections, { ...controls, totalPages: source.totalPages });
+  const qa = runQaChecks({ sections, slides, controls: { ...controls, totalPages: source.totalPages } });
+  await writePptx(slides, outputPath);
+  return { extracted: source, chunks, summaries, sections, slides, qa };
+}
+
+function parseBool(v, fallback) {
+  if (v === undefined) return fallback;
+  return String(v).toLowerCase() === "true";
+}
+
+async function main() {
+  const args = parseArgs(process.argv);
+  const outputPath = args.out || "lecture-output.pptx";
+
+  const controls = {
+    targetAudience: args.audience || "medical students",
+    verbosity: args.verbosity || "standard",
+    includeFigures: parseBool(args.includeFigures, false),
+    slideCountTarget: args.slideCountTarget ? Number(args.slideCountTarget) : undefined,
+    slidesPer10Pages: args.slidesPer10Pages ? Number(args.slidesPer10Pages) : 4,
+  };
+
+  const samplePages = [
+    `1 INTRODUCTION TO SEPSIS. Sepsis is defined as life-threatening organ dysfunction caused by a dysregulated host response to infection. The mechanism leads to endothelial injury and capillary leak. First, identify suspected infection. Second, calculate SOFA score. Then start broad-spectrum antibiotics and fluid resuscitation. A multicenter study reported 18% lower mortality when antibiotics were given within one hour. In conclusion, early recognition improves outcomes.`,
+    `2 HEMODYNAMIC MANAGEMENT. Septic shock refers to sepsis with persistent hypotension requiring vasopressors despite fluids. The pathway causes mitochondrial dysfunction and tissue hypoperfusion. First, deliver 30 mL/kg crystalloid. Next, target MAP of at least 65 mmHg using norepinephrine. Trial results showed faster lactate clearance with protocolized reassessment. Therefore, serial reassessment is recommended.`,
+    `3 ANTIMICROBIAL STRATEGY. Source control is defined as physical removal of infection focus. Mechanism involves reducing pathogen burden and inflammatory signaling. Step 1: obtain blood cultures before antibiotics if no delay. Step 2: narrow therapy after susceptibility results. Evidence from cohort studies shows reduced resistance when de-escalation is applied. In conclusion, stewardship and source control reduce complications.`
+  ];
+
+  const result = args.sample
+    ? await generateLectureDeck({ extracted: fromPageTextArray(samplePages), controls, outputPath })
+    : await generateLectureDeck({ pdfPath: args.pdf, controls, outputPath });
+
+  console.log(`Generated ${result.slides.length} slides -> ${outputPath}`);
+  if (result.qa.warnings.length) {
+    console.log("QA warnings:");
+    for (const warning of result.qa.warnings) console.log(`- ${warning}`);
+  }
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
